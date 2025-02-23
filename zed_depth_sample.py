@@ -5,24 +5,41 @@ import random
 from ultralytics import YOLO
 import numpy as np
 
+from typing import Tuple
 
-def plot_one_box(x, img, color=None, label=None, line_thickness=None):
+
+def plot_one_box(
+    box: Tuple[int, int, int, int],
+    img: np.ndarray,
+    color: Tuple[int, int, int] = None,
+    label: str = None,
+    line_thickness: float = None,
+):
     """
-    description: Plots one bounding box on image.
-    param:
-        x:      a box likes [x1,y1,x2,y2]
-        img:    a opencv image object
-        color:  color to draw rectangle, such as (0,255,0)
-        label:  str
-        line_thickness: int
-    return:
-        no return
+    Plots one bounding box on image, with the given label on top of the plotted bounding box.
+
+    Parameters
+    ----------
+    box : Tuple[int, int, int, int]
+        A bounding box of type [x1, y1, x2, y2] consisting of pixel values that are not normalized.
+
+    img : np.ndarray
+        The image that the bounding box will be plotted to.
+
+    color : Tuple[int, int, int], optional
+        The color of the plotted bounding box. If no value is given a random color will be used.
+
+    label : str, optional
+        The text that will put on top of the bounding box.
+
+    line_thickness : float, optional
+        The thickness of used when plotting.
     """
     tl = (
         line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1
     )  # line/font thickness
     color = color or [random.randint(0, 255) for _ in range(3)]
-    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
+    c1, c2 = (int(box[0]), int(box[1])), (int(box[2]), int(box[3]))
     cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
     if label:
         tf = max(tl - 1, 1)  # font thickness
@@ -41,6 +58,42 @@ def plot_one_box(x, img, color=None, label=None, line_thickness=None):
         )
 
 
+def get_neighbors_coords(
+    image_shape: Tuple[int, int], center: [int, int], radius: float
+) -> np.ndarray:
+    """
+    Returns an array of (row, col) coordinates for all pixels within
+    a circle of given radius around the specified center pixel.
+
+    Parameters
+    -----------
+    image_shape : tuple
+        The shape of the image, e.g. (height, width) or (height, width, channels)
+
+    center : tuple
+        The (row, col) coordinate of the center pixel.
+
+    radius : float
+        The radius (in pixels) of the neighborhood.
+
+    Returns
+    -------
+    coords : ndarray
+        An array of shape (N, 2) where each row is a (row, col) coordinate.
+
+    """
+    # Use only the first two dimensions (rows, cols)
+    h, w = image_shape[:2]
+    # Create a grid of row indices and column indices
+    y, x = np.ogrid[:h, :w]
+    # Compute squared distance from center for each pixel
+    dist_sq = (y - center[0]) ** 2 + (x - center[1]) ** 2
+    # Create a boolean mask for pixels within the radius
+    mask = dist_sq <= radius ** 2
+    # np.argwhere returns the (row, col) coordinates where mask is True
+    return np.argwhere(mask)
+
+
 def main():
 
     model_weight_path = "models/yolov8n.pt"
@@ -48,6 +101,8 @@ def main():
     img_size = 640
     conf_threshold = 0.2
     iou_threshold = 0.45
+
+    depth_calculation_radius = 1
 
     # Create a Camera object
     zed = sl.Camera()
@@ -109,22 +164,40 @@ def main():
                     center_point_x = int((box[0] + box[2]) / 2)
                     center_point_y = int((box[1] + box[3]) / 2)
 
-                    # find the depth at the center of the target
-                    err, depth_value = depth_mat.get_value(
-                        center_point_x, center_point_y
+                    # get the coordinates of the pixels within the radius of the center.
+                    points_near_center = get_neighbors_coords(
+                        image_np.shape,
+                        (center_point_y, center_point_y),
+                        depth_calculation_radius,
                     )
 
-                    # convert to 3d coordinates
-                    u, v = center_point_x, center_point_y
+                    # calculate the average depth within the radius. This improves the depth accuracy
+                    # and avoids scenarios where the center might be nan or inf.
+                    total_depth = 0
+                    # keep track of the total points since some of them might me nan or inf.
+                    total_points = 0
+                    for point_x, point_y in points_near_center:
+                        err, depth_value = depth_mat.get_value(
+                            int(point_x), int(point_y)
+                        )
+                        # exclude nan or inf values.
+                        if not np.isnan(depth_value) and not np.isinf(depth_value):
+                            total_depth += depth_value
+                            total_points += 1
 
-                    Z = depth_value
-                    X = ((u - c_x) * Z) / (f_x)
-                    Y = ((v - c_y) * Z) / (f_y)
+                    # calculate 3d position of the object relative to the camera using the depth measurement.
+                    if total_depth > 0 and total_points > 0:
+                        # convert to 3d coordinates
+                        u, v = center_point_x, center_point_y
 
-                    label_text = f"x:{X:.2f}m y:{Y:.2f}m z:{Z:.2f}m"
+                        Z = total_depth / total_points
+                        X = ((u - c_x) * Z) / (f_x)
+                        Y = ((v - c_y) * Z) / (f_y)
 
-                    # Plot the bounding box and depth information on the label
-                    plot_one_box(box, image_np, (100, 100, 100), label_text, 2)
+                        label_text = f"box:{X:.2f}m y:{Y:.2f}m z:{Z:.2f}m"
+
+                        # Plot the bounding box and depth information on the label
+                        plot_one_box(box, image_np, (100, 100, 100), label_text, 2)
 
             # Display the left image from the numpy array
             cv2.imshow("Image", image_np)
